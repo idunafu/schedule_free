@@ -14,7 +14,9 @@ Authors: Aaron Defazio, Xingyu (Alice) Yang, Harsh Mehta, Konstantin Mishchenko,
 We provide several Schedule-Free optimizer implementations:
 - `SGDScheduleFree` and `SGDScheduleFreeReference`: Schedule-free variants of SGD
 - `AdamWScheduleFree` and `AdamWScheduleFreeReference`: Schedule-free variants of AdamW
+- Experimental `AdamWScheduleFree8bit`: Schedule-free AdamW with the Adam second-moment state stored in block-wise 8-bit form
 - `RAdamScheduleFree`: Schedule-free variant of RAdam, which eliminates the need for both learning rate scheduling and warmup (implementation community contributed)
+- Experimental `RAdamScheduleFree8bit`: Schedule-free RAdam with the RAdam second-moment state stored in block-wise 8-bit form
 - Experimental `ScheduleFreeWrapper` to combine with other optimizers
 
 `ScheduleFreeReference` versions have a simplified implementation, but which use more memory. There are also `ScheduleFreeClosure` versions which can be used with PyTorch's optimizer step closures.
@@ -43,6 +45,18 @@ wrapper version that can be used with any base optimizer.
 Since our optimizer uses two different points for gradient calls and test/val loss calculations, it's necessary to switch the param buffer between the two during training. This is done by calling `optimizer.train()` at the same place you call `model.train()` and `optimizer.eval()` at the same place you call `model.eval()`. The optimizer should also be placed in eval mode when storing checkpoints.
 
 If your code supports PyTorch Optimizer step closures, you can use the closure forms of the optimizers, which do not require the `.train()` and `.eval()` calls.
+
+`AdamWScheduleFree8bit` can be used as a drop-in replacement for `AdamWScheduleFree` when you want AdamW8bit-style optimizer-state savings without adding an external dependency. It quantizes `exp_avg_sq` using a block-wise `uint8` representation while keeping the Schedule-Free `z` sequence in the parameter dtype:
+
+```python
+optimizer = schedulefree.AdamWScheduleFree8bit(model.parameters(), lr=0.0025)
+```
+
+`RAdamScheduleFree8bit` follows the same approach for RAdam:
+
+```python
+optimizer = schedulefree.RAdamScheduleFree8bit(model.parameters(), lr=0.0025)
+```
 
 ## Paper
 If you use Schedule-Free training in your work, please cite our [preprint](https://arxiv.org/abs/2405.15682) as:

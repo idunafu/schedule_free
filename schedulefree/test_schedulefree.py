@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 import torch
 from schedulefree import (SGDScheduleFree, SGDScheduleFreeClosure, 
-    AdamWScheduleFree, AdamWScheduleFreeClosure, AdamWScheduleFreeReference, 
-    RAdamScheduleFree, RAdamScheduleFreeClosure,
+    AdamWScheduleFree, AdamWScheduleFree8bit, AdamWScheduleFreeClosure, AdamWScheduleFreeReference,
+    RAdamScheduleFree, RAdamScheduleFree8bit, RAdamScheduleFreeClosure,
     ScheduleFreeWrapper, ScheduleFreeWrapperReference, SGDScheduleFreeReference)
 
 def allclose(x, y):
@@ -187,6 +187,43 @@ def test_schedulefree_adam():
                 allclose(y, y_closure)
                 allclose(y, p_reference.data)
 
+def test_schedulefree_adam_8bit():
+    torch.manual_seed(1)
+    decay = 0.1
+    warmup = 2
+    weight = torch.randn(128).requires_grad_()
+    weight_8bit = torch.clone(weight.data).requires_grad_()
+    optimizer = AdamWScheduleFree(
+        [weight], lr=0.01, warmup_steps=warmup, weight_decay=decay, foreach=False)
+    optimizer_8bit = AdamWScheduleFree8bit(
+        [weight_8bit], lr=0.01, warmup_steps=warmup, weight_decay=decay,
+        block_size=16, min_8bit_size=0)
+
+    for step_idx in range(20):
+        optimizer.train()
+        optimizer_8bit.train()
+        grad = torch.rand_like(weight)
+
+        weight.grad = torch.clone(grad)
+        weight_8bit.grad = torch.clone(grad)
+
+        optimizer.step()
+        optimizer_8bit.step()
+
+        optimizer.eval()
+        optimizer_8bit.eval()
+
+    state_8bit = optimizer_8bit.state[weight_8bit]
+    assert state_8bit['exp_avg_sq_q'].dtype == torch.uint8
+    assert 'exp_avg_sq' not in state_8bit
+
+    assert torch.allclose(weight, weight_8bit, rtol=2e-2, atol=2e-3)
+    assert torch.allclose(
+        optimizer.state[weight]['z'],
+        optimizer_8bit.state[weight_8bit]['z'],
+        rtol=2e-2,
+        atol=2e-3)
+
 def test_schedulefree_radam():
     decay = 0.5
     weight_closure = torch.randn(3, 2).requires_grad_()
@@ -235,6 +272,42 @@ def test_schedulefree_radam():
                 y_closure = p_closure.lerp(end=z_closure, weight=1-0.9)
 
                 allclose(y, y_closure)
+
+def test_schedulefree_radam_8bit():
+    torch.manual_seed(1)
+    decay = 0.1
+    weight = torch.randn(128).requires_grad_()
+    weight_8bit = torch.clone(weight.data).requires_grad_()
+    optimizer = RAdamScheduleFree(
+        [weight], lr=0.01, weight_decay=decay, foreach=False)
+    optimizer_8bit = RAdamScheduleFree8bit(
+        [weight_8bit], lr=0.01, weight_decay=decay,
+        block_size=16, min_8bit_size=0)
+
+    for step_idx in range(20):
+        optimizer.train()
+        optimizer_8bit.train()
+        grad = torch.rand_like(weight)
+
+        weight.grad = torch.clone(grad)
+        weight_8bit.grad = torch.clone(grad)
+
+        optimizer.step()
+        optimizer_8bit.step()
+
+        optimizer.eval()
+        optimizer_8bit.eval()
+
+    state_8bit = optimizer_8bit.state[weight_8bit]
+    assert state_8bit['exp_avg_sq_q'].dtype == torch.uint8
+    assert 'exp_avg_sq' not in state_8bit
+
+    assert torch.allclose(weight, weight_8bit, rtol=2e-2, atol=2e-3)
+    assert torch.allclose(
+        optimizer.state[weight]['z'],
+        optimizer_8bit.state[weight_8bit]['z'],
+        rtol=2e-2,
+        atol=2e-3)
 
 def test_foreach():
     decay = 0.5
@@ -373,5 +446,7 @@ if __name__ == "__main__":
     test_foreach()
 
     test_schedulefree_adam()
+    test_schedulefree_adam_8bit()
     test_schedulefree_sgd()
     test_schedulefree_radam()
+    test_schedulefree_radam_8bit()

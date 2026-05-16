@@ -5,8 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 from .radam_schedulefree_closure import RAdamScheduleFreeClosure
 from .radam_schedulefree import RAdamScheduleFree
+from .radam_schedulefree_8bit import RAdamScheduleFree8bit
 from .adamw_schedulefree_closure import AdamWScheduleFreeClosure
 from .adamw_schedulefree import AdamWScheduleFree
+from .adamw_schedulefree_8bit import AdamWScheduleFree8bit
 from .adamw_schedulefree_reference import AdamWScheduleFreeReference
 from .adamw_schedulefree_paper import AdamWScheduleFreePaper
 from .sgd_schedulefree_closure import SGDScheduleFreeClosure
