@@ -58,6 +58,13 @@ optimizer = schedulefree.AdamWScheduleFree8bit(model.parameters(), lr=0.0025)
 optimizer = schedulefree.RAdamScheduleFree8bit(model.parameters(), lr=0.0025)
 ```
 
+For optimizer comparisons, `benchmarks/optimizer_8bit_comparison.py` runs a small image-classification benchmark across `AdamWScheduleFree`, `AdamWScheduleFree8bit`, and `ScheduleFreeWrapper(bitsandbytes.optim.AdamW8bit)` when bitsandbytes is installed:
+
+```bash
+python benchmarks/optimizer_8bit_comparison.py --device cuda --max-steps 200 --output-json results/optimizer_8bit.json
+python benchmarks/plot_optimizer_8bit_results.py results/optimizer_8bit.json --output results/optimizer_8bit.png
+```
+
 ## Paper
 If you use Schedule-Free training in your work, please cite our [preprint](https://arxiv.org/abs/2405.15682) as:
 ```
