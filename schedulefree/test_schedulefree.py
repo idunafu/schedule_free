@@ -1,13 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-# 
+#
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import torch
-from schedulefree import (SGDScheduleFree, SGDScheduleFreeClosure, 
-    AdamWScheduleFree, AdamWScheduleFreeClosure, AdamWScheduleFreeReference, 
+from schedulefree import (SGDScheduleFree, SGDScheduleFreeClosure,
+    AdamWScheduleFree, AdamWScheduleFreeClosure, AdamWScheduleFreeReference,
     RAdamScheduleFree, RAdamScheduleFreeClosure,
-    ScheduleFreeWrapper, ScheduleFreeWrapperReference, SGDScheduleFreeReference)
+    ScheduleFreeWrapper, ScheduleFreeWrapperReference, SGDScheduleFreeReference,
+    AdamCScheduleFreePlusPaper)
 
 def allclose(x, y):
     assert torch.allclose(x, y, rtol=1e-05, atol=1e-06)
@@ -18,11 +19,11 @@ def test_schedulefree_wrapper():
     weight1 = torch.randn(3, 2).requires_grad_()
     weight2 = torch.clone(weight1.detach()).requires_grad_()
     optimizer1 = SGDScheduleFree(
-        [weight1], lr=lr, 
+        [weight1], lr=lr,
         weight_decay=decay, momentum=0.9, foreach=False)
 
     optimizer2 = ScheduleFreeWrapper(
-        torch.optim.SGD([weight2], lr=lr, momentum=0.0), 
+        torch.optim.SGD([weight2], lr=lr, momentum=0.0),
         momentum=0.9,
         weight_decay_at_y=decay)
 
@@ -35,11 +36,11 @@ def test_schedulefree_wrapper_reference():
     weight1 = torch.randn(3, 2).requires_grad_()
     weight2 = torch.clone(weight1.detach()).requires_grad_()
     optimizer1 = SGDScheduleFree(
-        [weight1], lr=lr, 
+        [weight1], lr=lr,
         weight_decay=decay, momentum=0.9, foreach=False)
 
     optimizer2 = ScheduleFreeWrapperReference(
-        torch.optim.SGD([weight2], lr=lr, momentum=0.0), 
+        torch.optim.SGD([weight2], lr=lr, momentum=0.0),
         momentum=0.9,
         weight_decay_at_y=decay)
 
@@ -65,9 +66,150 @@ def compare_schedulefree_versions(weight1, optimizer1, weight2, optimizer2):
 
         optimizer1.eval()
         optimizer2.eval()
-                
+
         allclose(weight1, weight2)
- 
+
+
+def test_adamw_reference_inner_momentum_matches_wrap():
+    """Verify AdamWScheduleFreeReference with inner_momentum behaves identically
+    to ScheduleFreeWrapperReference wrapping torch.optim.AdamW with the same
+    parameters."""
+    lr = 0.3
+    inner_momentum = 0.9
+    outer_momentum = 0.95
+    beta2 = 0.999
+    eps = 1e-8
+
+    weight1 = torch.randn(3, 2).requires_grad_()
+    weight2 = torch.clone(weight1.detach()).requires_grad_()
+
+    optimizer1 = AdamWScheduleFreeReference(
+        [weight1],
+        lr=lr,
+        betas=(outer_momentum, beta2),
+        eps=eps,
+        weight_decay=0.0,
+        warmup_steps=0,
+        inner_momentum=inner_momentum,
+    )
+
+    optimizer2 = ScheduleFreeWrapperReference(
+        torch.optim.AdamW(
+            [weight2],
+            lr=lr,
+            betas=(inner_momentum, beta2),
+            eps=eps,
+            weight_decay=0.0,
+        ),
+        momentum=outer_momentum,
+        weight_decay_at_y=0.0,
+    )
+
+    # Pre-initialize AdamW's state. ScheduleFreeWrapperReference shares the
+    # state dict with the inner optimizer, so when the wrapper adds 'z', 'x',
+    # 'y' to the state, AdamW's `len(state) == 0` guard would otherwise skip
+    # initializing 'step', 'exp_avg', and 'exp_avg_sq'.
+    for p in [weight2]:
+        adamw_state = optimizer2.base.state[p]
+        adamw_state["step"] = torch.tensor(0.0)
+        adamw_state["exp_avg"] = torch.zeros_like(
+            p, memory_format=torch.preserve_format)
+        adamw_state["exp_avg_sq"] = torch.zeros_like(
+            p, memory_format=torch.preserve_format)
+
+    compare_schedulefree_versions(weight1, optimizer1, weight2, optimizer2)
+
+
+def test_adamw_reference_no_inner_momentum_no_buffer():
+    """When inner_momentum=0 (default), no exp_avg buffer should be allocated."""
+    weight = torch.randn(3, 2).requires_grad_()
+    optimizer = AdamWScheduleFreeReference([weight], lr=0.1, weight_decay=0.0)
+    optimizer.train()
+    weight.grad = torch.rand_like(weight)
+    optimizer.step()
+    state = optimizer.state[weight]
+    assert 'exp_avg' not in state
+    assert 'exp_avg_sq' in state
+    assert 'z' in state
+
+
+def test_adamw_inner_momentum_matches_reference():
+    """Verify AdamWScheduleFree with inner_momentum matches
+    AdamWScheduleFreeReference with the same inner_momentum, for both the
+    foreach and non-foreach code paths."""
+    lr = 0.3
+    decay = 0.5
+    warmup = 5
+    inner_momentum = 0.85
+
+    weight_ref = torch.randn(3, 2).requires_grad_()
+    weight = torch.clone(weight_ref.data).requires_grad_()
+    weight_foreach = torch.clone(weight_ref.data).requires_grad_()
+
+    optimizer_ref = AdamWScheduleFreeReference(
+        [weight_ref], lr=lr, warmup_steps=warmup, weight_decay=decay,
+        inner_momentum=inner_momentum)
+    optimizer = AdamWScheduleFree(
+        [weight], lr=lr, warmup_steps=warmup, weight_decay=decay,
+        inner_momentum=inner_momentum, foreach=False)
+    optimizer_foreach = AdamWScheduleFree(
+        [weight_foreach], lr=lr, warmup_steps=warmup, weight_decay=decay,
+        inner_momentum=inner_momentum, foreach=True)
+
+    for step_idx in range(10):
+        print(step_idx)
+        optimizer.train()
+        optimizer_ref.train()
+        optimizer_foreach.train()
+
+        grad = torch.rand_like(weight)
+        weight.grad = torch.clone(grad)
+        weight_ref.grad = torch.clone(grad)
+        weight_foreach.grad = torch.clone(grad)
+
+        optimizer.step()
+        optimizer_ref.step()
+        optimizer_foreach.step()
+
+        optimizer.eval()
+        optimizer_ref.eval()
+        optimizer_foreach.eval()
+
+        state = optimizer.state[weight]
+        state_ref = optimizer_ref.state[weight_ref]
+        state_foreach = optimizer_foreach.state[weight_foreach]
+
+        # Inner-momentum buffers should be allocated.
+        assert 'exp_avg' in state
+        assert 'exp_avg' in state_ref
+        assert 'exp_avg' in state_foreach
+
+        # Param value in eval mode is x; check equivalence.
+        allclose(weight, weight_ref)
+        allclose(weight, weight_foreach)
+
+        # z and exp_avg should also match.
+        allclose(state['z'], state_ref['z'])
+        allclose(state['z'], state_foreach['z'])
+        allclose(state['exp_avg'], state_ref['exp_avg'])
+        allclose(state['exp_avg'], state_foreach['exp_avg'])
+
+
+def test_adamw_no_inner_momentum_no_buffer():
+    """When inner_momentum=0 (default), AdamWScheduleFree should not allocate
+    an exp_avg buffer (for both foreach and non-foreach paths)."""
+    for use_foreach in [False, True]:
+        weight = torch.randn(3, 2).requires_grad_()
+        optimizer = AdamWScheduleFree(
+            [weight], lr=0.1, weight_decay=0.0, foreach=use_foreach)
+        optimizer.train()
+        weight.grad = torch.rand_like(weight)
+        optimizer.step()
+        state = optimizer.state[weight]
+        assert 'exp_avg' not in state, f"foreach={use_foreach}"
+        assert 'exp_avg_sq' in state
+        assert 'z' in state
+
 
 def test_schedulefree_sgd():
     decay = 0.5
@@ -101,14 +243,14 @@ def test_schedulefree_sgd():
         optimizer_ref.eval()
 
         for group_closure, group, group_ref in zip(
-                optimizer_closure.param_groups, 
-                optimizer.param_groups, 
+                optimizer_closure.param_groups,
+                optimizer.param_groups,
                 optimizer_ref.param_groups):
             for p_closure, p, p_ref in zip(
                     group_closure['params'],
-                    group['params'], 
+                    group['params'],
                     group_ref['params']):
-                
+
                 state_closure = optimizer_closure.state[p_closure]
                 state_ref = optimizer_ref.state[p_ref]
                 state = optimizer.state[p]
@@ -121,7 +263,7 @@ def test_schedulefree_sgd():
                 z = state['z']
                 assert torch.allclose(z, z_closure)
                 assert torch.allclose(z, z_ref)
- 
+
 def test_schedulefree_adam():
     decay = 0.5
     warmup = 5
@@ -165,7 +307,7 @@ def test_schedulefree_adam():
                 allclose(p, p_reference)
                 allclose(z, z_closure)
                 allclose(z, z_reference)
- 
+
         optimizer.train()
         optimizer_reference.train()
 
@@ -219,7 +361,7 @@ def test_schedulefree_radam():
 
                 allclose(p, p_closure)
                 allclose(z, z_closure)
- 
+
         optimizer.train()
 
         for group_closure, group in zip(optimizer_closure.param_groups, optimizer.param_groups):
@@ -249,7 +391,7 @@ def test_foreach():
     optimizer_foreach = AdamWScheduleFree([
         {'params': [weight_foreach, weight_foreach2]},
         {'params': [weight_foreach_nograd]},
-        {'params': []}], 
+        {'params': []}],
         lr=0.3, warmup_steps=warmup, weight_decay=decay, foreach=True)
     optimizer = AdamWScheduleFree([
         {'params': [weight, weight2]},
@@ -359,6 +501,129 @@ def test_compile():
         assert torch.allclose(weight, weight_uncompiled)
 
 
+def test_adamc_schedulefree_polyak_runs():
+    """Smoke test: AdamCScheduleFreePlusPaper takes several steps
+    without errors in a non-distributed environment (DTensor detection
+    should skip all_reduce calls)."""
+    torch.manual_seed(42)
+    weight = torch.randn(3, 2).requires_grad_()
+    optimizer = AdamCScheduleFreePlusPaper(
+        [weight], lr=1.0, weight_decay=0.0)
+
+    initial = weight.detach().clone()
+    optimizer.train()
+
+    for step_idx in range(5):
+        grad = torch.rand_like(weight)
+        weight.grad = grad
+        function_value = float(grad.pow(2).sum().item())  # positive scalar
+        optimizer.step_func(function_value=function_value)
+
+    # The parameter should have moved.
+    assert not torch.allclose(weight, initial)
+
+    # State should contain all the expected buffers.
+    state = optimizer.state[weight]
+    for key in ['x', 'y', 'z', 'exp_avg', 'exp_avg_sq']:
+        assert key in state, f"missing state key: {key}"
+
+    # Group state populated for logging.
+    group = optimizer.param_groups[0]
+    for key in ['scheduled_lr', 'grad_l1_ema', 'grad_l1_ema_corr',
+                'function_value_ema', 'ip_term', 'lr_max']:
+        assert key in group, f"missing group key: {key}"
+
+
+def test_adamc_schedulefree_polyak_train_eval():
+    """Verify p is set to y in train mode and x in eval mode."""
+    torch.manual_seed(0)
+    weight = torch.randn(3, 2).requires_grad_()
+    optimizer = AdamCScheduleFreePlusPaper([weight], lr=1.0)
+
+    optimizer.train()
+    weight.grad = torch.rand_like(weight)
+    optimizer.step_func(function_value=1.0)
+
+    optimizer.eval()
+    # In eval mode, p should equal state['x'].
+    allclose(weight, optimizer.state[weight]['x'])
+
+    optimizer.train()
+    # Back in train mode, p should equal state['y'].
+    allclose(weight, optimizer.state[weight]['y'])
+
+
+def test_adamc_schedulefree_polyak_requires_train_mode():
+    """step_func should raise when called without first entering train
+    mode."""
+    weight = torch.randn(3, 2).requires_grad_()
+    optimizer = AdamCScheduleFreePlusPaper([weight], lr=1.0)
+    weight.grad = torch.rand_like(weight)
+    raised = False
+    try:
+        optimizer.step_func(function_value=1.0)
+    except Exception as exc:
+        raised = True
+        assert "train mode" in str(exc)
+    assert raised, "step_func did not raise when not in train mode"
+
+
+def test_adamc_schedulefree_polyak_no_dtensor_no_allreduce():
+    """When no gradient is a DTensor, step_func must not invoke
+    torch.distributed.all_reduce, even if distributed happens to be
+    initialized.  We verify this by monkey-patching dist.all_reduce to
+    raise if called."""
+    import torch.distributed as dist
+
+    torch.manual_seed(1)
+    weight = torch.randn(3, 2).requires_grad_()
+    optimizer = AdamCScheduleFreePlusPaper([weight], lr=1.0)
+
+    original_all_reduce = dist.all_reduce
+    original_is_initialized = dist.is_initialized
+
+    called = {'all_reduce': False}
+
+    def fake_all_reduce(*args, **kwargs):
+        called['all_reduce'] = True
+        return original_all_reduce(*args, **kwargs)
+
+    dist.all_reduce = fake_all_reduce
+    # Pretend distributed is initialized, so the only thing that should
+    # gate the call is the DTensor detection.
+    dist.is_initialized = lambda: True
+    try:
+        optimizer.train()
+        weight.grad = torch.rand_like(weight)
+        optimizer.step_func(function_value=1.0)
+    finally:
+        dist.all_reduce = original_all_reduce
+        dist.is_initialized = original_is_initialized
+
+    assert not called['all_reduce'], (
+        "all_reduce was invoked for non-DTensor gradients")
+
+
+def test_adamc_schedulefree_polyak_multiple_param_groups():
+    """Optimizer should handle multiple param groups."""
+    torch.manual_seed(2)
+    w1 = torch.randn(3, 2).requires_grad_()
+    w2 = torch.randn(2, 4).requires_grad_()
+    optimizer = AdamCScheduleFreePlusPaper(
+        [{'params': [w1]}, {'params': [w2]}], lr=1.0)
+
+    optimizer.train()
+    for _ in range(3):
+        w1.grad = torch.rand_like(w1)
+        w2.grad = torch.rand_like(w2)
+        optimizer.step_func(function_value=1.0)
+    optimizer.eval()
+
+    # Both parameters should have buffered state.
+    assert 'z' in optimizer.state[w1]
+    assert 'z' in optimizer.state[w2]
+
+
 if __name__ == "__main__":
     torch.manual_seed(1)
 
@@ -373,5 +638,15 @@ if __name__ == "__main__":
     test_foreach()
 
     test_schedulefree_adam()
+    test_adamw_reference_inner_momentum_matches_wrap()
+    test_adamw_reference_no_inner_momentum_no_buffer()
+    test_adamw_inner_momentum_matches_reference()
+    test_adamw_no_inner_momentum_no_buffer()
     test_schedulefree_sgd()
     test_schedulefree_radam()
+
+    test_adamc_schedulefree_polyak_runs()
+    test_adamc_schedulefree_polyak_train_eval()
+    test_adamc_schedulefree_polyak_requires_train_mode()
+    test_adamc_schedulefree_polyak_no_dtensor_no_allreduce()
+    test_adamc_schedulefree_polyak_multiple_param_groups()
