@@ -8,9 +8,12 @@ from typing_extensions import TypeAlias
 import torch
 import torch.optim
 from ._quantized_state import (
+    BNB_DYNAMIC_BACKEND,
     dequantize_exp_avg_sq,
     init_exp_avg_sq_state,
     quantize_exp_avg_sq,
+    validate_block_size,
+    validate_quant_backend,
 )
 try:
     from torch.optim.optimizer import ParamsT
@@ -56,6 +59,10 @@ class AdamWScheduleFree8bit(torch.optim.Optimizer):
             (default 4096).
         min_8bit_size (int): Parameters with fewer values keep exp_avg_sq in
             full precision to avoid overhead on tiny tensors (default 4096).
+        quant_backend (str): 8-bit state backend. "bnb_dynamic" uses a
+            bitsandbytes-style unsigned dynamic qmap with per-block absmax.
+            "torch_linear" keeps the previous linear uint8 scaling backend.
+            (default "bnb_dynamic").
     """
     def __init__(self,
                  params: ParamsT,
@@ -68,13 +75,14 @@ class AdamWScheduleFree8bit(torch.optim.Optimizer):
                  weight_lr_power: float = 2.0,
                  foreach: Optional[bool] = False,
                  block_size: int = 4096,
-                 min_8bit_size: int = 4096
+                 min_8bit_size: int = 4096,
+                 quant_backend: str = BNB_DYNAMIC_BACKEND
                  ):
 
         if foreach:
             raise ValueError("AdamWScheduleFree8bit does not support foreach=True")
-        if block_size <= 0:
-            raise ValueError("block_size must be positive")
+        validate_quant_backend(quant_backend)
+        validate_block_size(block_size, quant_backend)
         if min_8bit_size < 0:
             raise ValueError("min_8bit_size must be non-negative")
 
@@ -92,13 +100,15 @@ class AdamWScheduleFree8bit(torch.optim.Optimizer):
                         weight_decay=weight_decay,
                         foreach=False,
                         block_size=block_size,
-                        min_8bit_size=min_8bit_size)
+                        min_8bit_size=min_8bit_size,
+                        quant_backend=quant_backend)
         super().__init__(params, defaults)
 
     @classmethod
     def _init_exp_avg_sq(cls, state: Dict[str, Any], p: torch.Tensor,
-                         block_size: int, min_8bit_size: int) -> None:
-        init_exp_avg_sq_state(state, p, block_size, min_8bit_size)
+                         block_size: int, min_8bit_size: int,
+                         quant_backend: str) -> None:
+        init_exp_avg_sq_state(state, p, block_size, min_8bit_size, quant_backend)
 
     @staticmethod
     def _dequantize_exp_avg_sq(state: Dict[str, Any], p: torch.Tensor) -> torch.Tensor:
@@ -110,7 +120,19 @@ class AdamWScheduleFree8bit(torch.optim.Optimizer):
 
     def load_state_dict(self, state_dict):  # type: ignore[override]
         result = super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            group.setdefault('quant_backend', BNB_DYNAMIC_BACKEND)
         for state in self.state.values():
+            if ('exp_avg_sq_q' in state and
+                    state.get('exp_avg_sq_quant_backend') not in ('bnb_dynamic', 'torch_linear')):
+                if 'exp_avg_sq_absmax' in state:
+                    state['exp_avg_sq_quant_backend'] = 'bnb_dynamic'
+                else:
+                    state['exp_avg_sq_quant_backend'] = 'torch_linear'
+            if 'exp_avg_sq_q' in state and state['exp_avg_sq_q'].dtype != torch.uint8:
+                state['exp_avg_sq_q'] = state['exp_avg_sq_q'].to(dtype=torch.uint8)
+            if 'exp_avg_sq_absmax' in state:
+                state['exp_avg_sq_absmax'] = state['exp_avg_sq_absmax'].to(dtype=torch.float32)
             if 'exp_avg_sq_scale' in state:
                 state['exp_avg_sq_scale'] = state['exp_avg_sq_scale'].to(dtype=torch.float32)
         return result
@@ -169,6 +191,7 @@ class AdamWScheduleFree8bit(torch.optim.Optimizer):
             weight_lr_power = group['weight_lr_power']
             block_size = group['block_size']
             min_8bit_size = group['min_8bit_size']
+            quant_backend = group['quant_backend']
 
             if k < warmup_steps:
               sched = (k+1) / warmup_steps
@@ -195,7 +218,7 @@ class AdamWScheduleFree8bit(torch.optim.Optimizer):
                 state = self.state[p]
                 if 'z' not in state:
                     state['z'] = torch.clone(p, memory_format=torch.preserve_format)
-                    self._init_exp_avg_sq(state, p, block_size, min_8bit_size)
+                    self._init_exp_avg_sq(state, p, block_size, min_8bit_size, quant_backend)
 
             for p in active_p:
                 y = p # Notation to match theory

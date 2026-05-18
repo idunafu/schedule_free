@@ -46,10 +46,17 @@ Since our optimizer uses two different points for gradient calls and test/val lo
 
 If your code supports PyTorch Optimizer step closures, you can use the closure forms of the optimizers, which do not require the `.train()` and `.eval()` calls.
 
-`AdamWScheduleFree8bit` can be used as a drop-in replacement for `AdamWScheduleFree` when you want AdamW8bit-style optimizer-state savings without adding an external dependency. It quantizes `exp_avg_sq` using a block-wise `uint8` representation while keeping the Schedule-Free `z` sequence in the parameter dtype:
+`AdamWScheduleFree8bit` can be used as a drop-in replacement for `AdamWScheduleFree` when you want AdamW8bit-style optimizer-state savings. By default it quantizes `exp_avg_sq` with a bitsandbytes-style unsigned dynamic qmap plus per-block absmax while keeping the Schedule-Free `z` sequence in the parameter dtype:
 
 ```python
 optimizer = schedulefree.AdamWScheduleFree8bit(model.parameters(), lr=0.0025)
+```
+
+The default `quant_backend="bnb_dynamic"` supports bitsandbytes block sizes `64, 128, 256, 512, 1024, 2048, 4096`. The earlier linear uint8 scaling backend is still available for compatibility:
+
+```python
+optimizer = schedulefree.AdamWScheduleFree8bit(
+    model.parameters(), lr=0.0025, quant_backend="torch_linear")
 ```
 
 `RAdamScheduleFree8bit` follows the same approach for RAdam:
@@ -58,12 +65,17 @@ optimizer = schedulefree.AdamWScheduleFree8bit(model.parameters(), lr=0.0025)
 optimizer = schedulefree.RAdamScheduleFree8bit(model.parameters(), lr=0.0025)
 ```
 
-For optimizer comparisons, `benchmarks/optimizer_8bit_comparison.py` runs a small image-classification benchmark across `AdamWScheduleFree`, `AdamWScheduleFree8bit`, and `ScheduleFreeWrapper(bitsandbytes.optim.AdamW8bit)` when bitsandbytes is installed:
+For optimizer comparisons, `benchmarks/optimizer_8bit_comparison.py` runs a small image-classification benchmark across `AdamWScheduleFree`, `AdamWScheduleFree8bit`, `RAdamScheduleFree`, `RAdamScheduleFree8bit`, and bitsandbytes `AdamW8bit` wrapped with Schedule-Free wrapper logic when bitsandbytes is installed:
 
 ```bash
 python benchmarks/optimizer_8bit_comparison.py --device cuda --max-steps 200 --output-json results/optimizer_8bit.json
+python benchmarks/optimizer_8bit_comparison.py --device cuda --max-steps 200 --quant-backend torch_linear
+python benchmarks/optimizer_8bit_comparison.py --device cuda --models resnet50,vit-tiny --image-size 224 --max-steps 20
 python benchmarks/plot_optimizer_8bit_results.py results/optimizer_8bit.json --output results/optimizer_8bit.png
+python benchmarks/plot_optimizer_8bit_results.py results/optimizer_8bit.json --kind curves --output results/optimizer_8bit_curves.png
 ```
+
+Available benchmark models are `tiny-cnn`, `resnet50`, and `vit-tiny`. The ViT-tiny benchmark uses `timm`, which is included in the development dependency group.
 
 ## Paper
 If you use Schedule-Free training in your work, please cite our [preprint](https://arxiv.org/abs/2405.15682) as:

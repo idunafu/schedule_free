@@ -197,7 +197,7 @@ def test_schedulefree_adam_8bit():
         [weight], lr=0.01, warmup_steps=warmup, weight_decay=decay, foreach=False)
     optimizer_8bit = AdamWScheduleFree8bit(
         [weight_8bit], lr=0.01, warmup_steps=warmup, weight_decay=decay,
-        block_size=16, min_8bit_size=0)
+        block_size=64, min_8bit_size=0)
 
     for step_idx in range(20):
         optimizer.train()
@@ -215,6 +215,8 @@ def test_schedulefree_adam_8bit():
 
     state_8bit = optimizer_8bit.state[weight_8bit]
     assert state_8bit['exp_avg_sq_q'].dtype == torch.uint8
+    assert state_8bit['exp_avg_sq_absmax'].dtype == torch.float32
+    assert state_8bit['exp_avg_sq_quant_backend'] == 'bnb_dynamic'
     assert 'exp_avg_sq' not in state_8bit
 
     assert torch.allclose(weight, weight_8bit, rtol=2e-2, atol=2e-3)
@@ -223,6 +225,85 @@ def test_schedulefree_adam_8bit():
         optimizer_8bit.state[weight_8bit]['z'],
         rtol=2e-2,
         atol=2e-3)
+
+def test_schedulefree_adam_8bit_torch_linear_backend():
+    torch.manual_seed(1)
+    weight = torch.randn(128).requires_grad_()
+    optimizer_8bit = AdamWScheduleFree8bit(
+        [weight], lr=0.01, warmup_steps=2, weight_decay=0.1,
+        block_size=16, min_8bit_size=0, quant_backend="torch_linear")
+
+    for _ in range(3):
+        optimizer_8bit.train()
+        weight.grad = torch.rand_like(weight)
+        optimizer_8bit.step()
+        optimizer_8bit.eval()
+
+    state_8bit = optimizer_8bit.state[weight]
+    assert state_8bit['exp_avg_sq_q'].dtype == torch.uint8
+    assert state_8bit['exp_avg_sq_scale'].dtype == torch.float32
+    assert state_8bit['exp_avg_sq_quant_backend'] == 'torch_linear'
+    assert 'exp_avg_sq' not in state_8bit
+
+def test_schedulefree_adam_8bit_bnb_block_size_validation():
+    weight = torch.randn(128).requires_grad_()
+    try:
+        AdamWScheduleFree8bit([weight], block_size=16, quant_backend="bnb_dynamic")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("bnb_dynamic should reject unsupported block sizes")
+
+    AdamWScheduleFree8bit([weight], block_size=16, quant_backend="torch_linear")
+
+def test_schedulefree_adam_8bit_checkpoint_roundtrip():
+    torch.manual_seed(1)
+    weight = torch.randn(128).requires_grad_()
+    restored_weight = torch.clone(weight.data).requires_grad_()
+    optimizer = AdamWScheduleFree8bit([weight], lr=0.01, block_size=64, min_8bit_size=0)
+    restored = AdamWScheduleFree8bit([restored_weight], lr=0.01, block_size=64, min_8bit_size=0)
+
+    optimizer.train()
+    weight.grad = torch.rand_like(weight)
+    optimizer.step()
+    optimizer.eval()
+
+    restored.load_state_dict(optimizer.state_dict())
+    restored.train()
+    restored_weight.grad = torch.rand_like(restored_weight)
+    restored.step()
+
+    restored_state = restored.state[restored_weight]
+    assert restored_state['exp_avg_sq_absmax'].dtype == torch.float32
+    assert restored_state['exp_avg_sq_quant_backend'] == 'bnb_dynamic'
+
+def test_schedulefree_adam_8bit_loads_old_linear_checkpoint():
+    torch.manual_seed(1)
+    weight = torch.randn(128).requires_grad_()
+    restored_weight = torch.clone(weight.data).requires_grad_()
+    optimizer = AdamWScheduleFree8bit(
+        [weight], lr=0.01, block_size=16, min_8bit_size=0,
+        quant_backend="torch_linear")
+    restored = AdamWScheduleFree8bit([restored_weight], lr=0.01)
+
+    optimizer.train()
+    weight.grad = torch.rand_like(weight)
+    optimizer.step()
+    optimizer.eval()
+
+    state_dict = optimizer.state_dict()
+    for group in state_dict["param_groups"]:
+        group.pop("quant_backend", None)
+    for state in state_dict["state"].values():
+        state.pop("exp_avg_sq_quant_backend", None)
+
+    restored.load_state_dict(state_dict)
+    restored.train()
+    restored_weight.grad = torch.rand_like(restored_weight)
+    restored.step()
+
+    restored_state = restored.state[restored_weight]
+    assert restored_state['exp_avg_sq_quant_backend'] == 'torch_linear'
 
 def test_schedulefree_radam():
     decay = 0.5
@@ -282,7 +363,7 @@ def test_schedulefree_radam_8bit():
         [weight], lr=0.01, weight_decay=decay, foreach=False)
     optimizer_8bit = RAdamScheduleFree8bit(
         [weight_8bit], lr=0.01, weight_decay=decay,
-        block_size=16, min_8bit_size=0)
+        block_size=64, min_8bit_size=0)
 
     for step_idx in range(20):
         optimizer.train()
@@ -300,6 +381,8 @@ def test_schedulefree_radam_8bit():
 
     state_8bit = optimizer_8bit.state[weight_8bit]
     assert state_8bit['exp_avg_sq_q'].dtype == torch.uint8
+    assert state_8bit['exp_avg_sq_absmax'].dtype == torch.float32
+    assert state_8bit['exp_avg_sq_quant_backend'] == 'bnb_dynamic'
     assert 'exp_avg_sq' not in state_8bit
 
     assert torch.allclose(weight, weight_8bit, rtol=2e-2, atol=2e-3)
@@ -308,6 +391,36 @@ def test_schedulefree_radam_8bit():
         optimizer_8bit.state[weight_8bit]['z'],
         rtol=2e-2,
         atol=2e-3)
+
+def test_schedulefree_radam_8bit_torch_linear_backend():
+    torch.manual_seed(1)
+    weight = torch.randn(128).requires_grad_()
+    optimizer_8bit = RAdamScheduleFree8bit(
+        [weight], lr=0.01, weight_decay=0.1,
+        block_size=16, min_8bit_size=0, quant_backend="torch_linear")
+
+    for _ in range(3):
+        optimizer_8bit.train()
+        weight.grad = torch.rand_like(weight)
+        optimizer_8bit.step()
+        optimizer_8bit.eval()
+
+    state_8bit = optimizer_8bit.state[weight]
+    assert state_8bit['exp_avg_sq_q'].dtype == torch.uint8
+    assert state_8bit['exp_avg_sq_scale'].dtype == torch.float32
+    assert state_8bit['exp_avg_sq_quant_backend'] == 'torch_linear'
+    assert 'exp_avg_sq' not in state_8bit
+
+def test_schedulefree_radam_8bit_bnb_block_size_validation():
+    weight = torch.randn(128).requires_grad_()
+    try:
+        RAdamScheduleFree8bit([weight], block_size=16, quant_backend="bnb_dynamic")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("bnb_dynamic should reject unsupported block sizes")
+
+    RAdamScheduleFree8bit([weight], block_size=16, quant_backend="torch_linear")
 
 def test_foreach():
     decay = 0.5
@@ -447,6 +560,12 @@ if __name__ == "__main__":
 
     test_schedulefree_adam()
     test_schedulefree_adam_8bit()
+    test_schedulefree_adam_8bit_torch_linear_backend()
+    test_schedulefree_adam_8bit_bnb_block_size_validation()
+    test_schedulefree_adam_8bit_checkpoint_roundtrip()
+    test_schedulefree_adam_8bit_loads_old_linear_checkpoint()
     test_schedulefree_sgd()
     test_schedulefree_radam()
     test_schedulefree_radam_8bit()
+    test_schedulefree_radam_8bit_torch_linear_backend()
+    test_schedulefree_radam_8bit_bnb_block_size_validation()

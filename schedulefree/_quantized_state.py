@@ -6,9 +6,15 @@
 from typing import Any, Dict, Tuple
 import math
 import torch
+import bitsandbytes.functional as bnb_functional
 
 
 _MAX_QUANT_CHUNK_VALUES = 1024 * 1024
+TORCH_LINEAR_BACKEND = "torch_linear"
+BNB_DYNAMIC_BACKEND = "bnb_dynamic"
+VALID_QUANT_BACKENDS = (BNB_DYNAMIC_BACKEND, TORCH_LINEAR_BACKEND)
+BNB_BLOCK_SIZES = (64, 128, 256, 512, 1024, 2048, 4096)
+_QMAP_CACHE: Dict[torch.device, torch.Tensor] = {}
 
 
 def _num_blocks(numel: int, block_size: int) -> int:
@@ -25,13 +31,52 @@ def _use_8bit_state(p: torch.Tensor, min_8bit_size: int) -> bool:
     return p.is_floating_point() and p.numel() >= min_8bit_size
 
 
+def validate_quant_backend(quant_backend: str) -> None:
+    if quant_backend not in VALID_QUANT_BACKENDS:
+        raise ValueError(
+            f"quant_backend must be one of {VALID_QUANT_BACKENDS}, got {quant_backend!r}")
+
+
+def validate_block_size(block_size: int, quant_backend: str) -> None:
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if quant_backend == BNB_DYNAMIC_BACKEND and block_size not in BNB_BLOCK_SIZES:
+        raise ValueError(
+            f"bnb_dynamic quantization requires block_size to be one of {BNB_BLOCK_SIZES}")
+
+
+def _get_bnb_unsigned_qmap(device: torch.device) -> torch.Tensor:
+    qmap = _QMAP_CACHE.get(device)
+    if qmap is None:
+        qmap = bnb_functional.create_dynamic_map(signed=False).to(device)
+        _QMAP_CACHE[device] = qmap
+    return qmap
+
+
+def _backend_for_state(state: Dict[str, Any]) -> str:
+    backend = state.get("exp_avg_sq_quant_backend")
+    if backend in VALID_QUANT_BACKENDS:
+        return backend
+    if "exp_avg_sq_absmax" in state:
+        return BNB_DYNAMIC_BACKEND
+    return TORCH_LINEAR_BACKEND
+
+
 def init_exp_avg_sq_state(state: Dict[str, Any], p: torch.Tensor,
-                          block_size: int, min_8bit_size: int) -> None:
+                          block_size: int, min_8bit_size: int,
+                          quant_backend: str = BNB_DYNAMIC_BACKEND) -> None:
+    validate_quant_backend(quant_backend)
+    validate_block_size(block_size, quant_backend)
+
     if _use_8bit_state(p, min_8bit_size):
         num_blocks = _num_blocks(p.numel(), block_size)
         state['exp_avg_sq_q'] = torch.zeros(p.numel(), dtype=torch.uint8, device=p.device)
-        state['exp_avg_sq_scale'] = torch.zeros(num_blocks, dtype=torch.float32, device=p.device)
         state['exp_avg_sq_block_size'] = block_size
+        state['exp_avg_sq_quant_backend'] = quant_backend
+        if quant_backend == BNB_DYNAMIC_BACKEND:
+            state['exp_avg_sq_absmax'] = torch.zeros(num_blocks, dtype=torch.float32, device=p.device)
+        else:
+            state['exp_avg_sq_scale'] = torch.zeros(num_blocks, dtype=torch.float32, device=p.device)
     else:
         state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
@@ -52,6 +97,26 @@ def _ensure_quantized_state_device(state: Dict[str, Any],
 
 
 def dequantize_exp_avg_sq(state: Dict[str, Any], p: torch.Tensor) -> torch.Tensor:
+    backend = _backend_for_state(state)
+    if backend == BNB_DYNAMIC_BACKEND:
+        q = state['exp_avg_sq_q']
+        absmax = state['exp_avg_sq_absmax']
+        if q.device != p.device:
+            q = q.to(p.device)
+            state['exp_avg_sq_q'] = q
+        if absmax.device != p.device or absmax.dtype != torch.float32:
+            absmax = absmax.to(device=p.device, dtype=torch.float32)
+            state['exp_avg_sq_absmax'] = absmax
+        if q.numel() == 0:
+            return torch.empty_like(p)
+        quant_state = bnb_functional.QuantState(
+            absmax=absmax,
+            code=_get_bnb_unsigned_qmap(p.device),
+            blocksize=state['exp_avg_sq_block_size'],
+            dtype=p.dtype,
+        )
+        return bnb_functional.dequantize_blockwise(q, quant_state=quant_state).view_as(p)
+
     q, scale = _ensure_quantized_state_device(state, p.device)
     numel = q.numel()
     exp_avg_sq = torch.empty(numel, dtype=p.dtype, device=p.device)
@@ -75,6 +140,28 @@ def dequantize_exp_avg_sq(state: Dict[str, Any], p: torch.Tensor) -> torch.Tenso
 
 
 def quantize_exp_avg_sq(state: Dict[str, Any], exp_avg_sq: torch.Tensor) -> None:
+    backend = _backend_for_state(state)
+    if backend == BNB_DYNAMIC_BACKEND:
+        q = state['exp_avg_sq_q']
+        absmax = state['exp_avg_sq_absmax']
+        if q.device != exp_avg_sq.device:
+            q = q.to(exp_avg_sq.device)
+            state['exp_avg_sq_q'] = q
+        if absmax.device != exp_avg_sq.device or absmax.dtype != torch.float32:
+            absmax = absmax.to(device=exp_avg_sq.device, dtype=torch.float32)
+            state['exp_avg_sq_absmax'] = absmax
+        if q.numel() == 0:
+            return
+        _, quant_state = bnb_functional.quantize_blockwise(
+            exp_avg_sq.detach().reshape(-1),
+            code=_get_bnb_unsigned_qmap(exp_avg_sq.device),
+            absmax=absmax,
+            out=q,
+            blocksize=state['exp_avg_sq_block_size'],
+        )
+        state['exp_avg_sq_absmax'] = quant_state.absmax
+        return
+
     q, scale = _ensure_quantized_state_device(state, exp_avg_sq.device)
     numel = q.numel()
 
