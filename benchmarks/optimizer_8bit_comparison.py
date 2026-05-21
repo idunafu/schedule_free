@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from typing import List
 
 import torch
-
 from optimizer_bench.datasets import build_datasets
 from optimizer_bench.models import MODEL_CHOICES, build_model
 from optimizer_bench.optimizers import OptionalOptimizerUnavailable
@@ -17,7 +15,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Compare Schedule-Free optimizers, integrated 8-bit variants, and "
             "bitsandbytes AdamW8bit wrapped with Schedule-Free wrapper logic."
-        )
+        ),
     )
     parser.add_argument("--dataset", choices=["synthetic-cifar10", "mnist", "cifar10"], default="synthetic-cifar10")
     parser.add_argument("--data-root", default="data")
@@ -50,11 +48,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_csv(value: str) -> List[str]:
+def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def validate_models(model_names: List[str]) -> None:
+def validate_models(model_names: list[str]) -> None:
     invalid = [name for name in model_names if name not in MODEL_CHOICES]
     if invalid:
         raise ValueError(f"Unknown model(s): {', '.join(invalid)}. Choose from {', '.join(MODEL_CHOICES)}.")
@@ -69,7 +67,7 @@ def main() -> None:
     validate_models(requested_models)
     requested_optimizers = parse_csv(args.optimizers)
 
-    results: List[BenchResult] = []
+    results: list[BenchResult] = []
     for model_name in requested_models:
         torch.manual_seed(args.seed)
         initial_model = build_model(model_name, channels=channels, classes=classes, image_size=args.image_size)
@@ -88,7 +86,7 @@ def main() -> None:
                         classes,
                         args,
                         device,
-                    )
+                    ),
                 )
             except OptionalOptimizerUnavailable as exc:
                 if args.fail_on_skip or optimizer_name != "wrapped-bnb-adamw8bit":
